@@ -1,0 +1,152 @@
+name: Docker Image
+
+# 只在打标签时构建发布；日常提交不再触发镜像构建
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build:
+    # 每个平台都使用同架构的原生 runner 构建，不再依赖 QEMU 模拟 arm64
+    # （此前在 x86 上模拟编译 arm64 常逼近超时，ARM runner 为原生速度）
+    runs-on: ${{ matrix.runner }}
+    # GitHub 默认 job 超时是 360 分钟，卡住时会白跑 6 小时；这里收紧到 60 分钟快速失败
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    # 同一 ref 的同一平台只保留最新一次构建，避免重复 push 叠加；
+    # group 带上 platform，矩阵里的 amd64 / arm64 不会互相取消
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-build-${{ matrix.platform }}
+      cancel-in-progress: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # GHCR 要求仓库名全小写，而 github.repository 可能含大写（如 LibreSpark/LibreTTS），
+      # 直接拼进镜像名会让 buildx 报 invalid reference format；Actions 表达式没有 lower()，只能用 shell 转
+      - name: Set lowercase image name
+        id: image
+        run: echo "name=$REGISTRY/$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          # 现在只按标签触发，is_default_branch 恒为 false，latest / sha 不再加该条件
+          tags: |
+            type=raw,value=latest
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=long,prefix=
+
+      - name: Build and push by digest (${{ matrix.platform }})
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # 按 ref + 平台隔离缓存 scope：不同 ref / 不同平台不再争抢同一份 GHA 缓存锁
+          cache-from: type=gha,scope=${{ github.ref_name }}-${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ github.ref_name }}-${{ matrix.platform }}
+          # 先按 digest 推送单架构镜像，最后由 merge job 汇总为多架构 manifest。
+          # push-by-digest 只是“不带标签地推送”，并不隐含 push=true；缺少 push=true 时镜像
+          # 只存在于构建机本地，导出的 digest 在 registry 上解析不到，merge 会报 not found
+          outputs: type=image,name=${{ steps.image.outputs.name }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p ${{ runner.temp }}/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          # artifact 名称不允许包含 "/"，用矩阵序号代替平台名
+          name: digests-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    runs-on: ubuntu-latest
+    needs: [build]
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-merge
+      cancel-in-progress: true
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set lowercase image name
+        id: image
+        run: echo "name=$REGISTRY/$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          # 现在只按标签触发，is_default_branch 恒为 false，latest / sha 不再加该条件
+          tags: |
+            type=raw,value=latest
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=long,prefix=
+
+      - name: Create manifest list and push
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf "${{ steps.image.outputs.name }}@sha256:%s " *)
+
+      # version 只在 v* 标签推送时才非空；普通提交时拼出的 "镜像名:" 是非法引用
+      - name: Inspect image
+        if: steps.meta.outputs.version != ''
+        run: |
+          docker buildx imagetools inspect ${{ steps.image.outputs.name }}:${{ steps.meta.outputs.version }}

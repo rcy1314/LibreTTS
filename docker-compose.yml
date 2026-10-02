@@ -1,5 +1,7 @@
 services:
   libretts:
+    # 官方镜像；本地修改过代码时可用 `docker compose build` 构建本地版本
+    image: ghcr.io/librespark/libretts:latest
     build: .
     container_name: libretts
     ports:
